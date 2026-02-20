@@ -39,6 +39,16 @@ interface RunSession {
   expiresAt: number;
 }
 
+const INPUT_DEBUG_STORAGE_KEY = 'snake-input-debug-log';
+
+const directionLabel = (direction: Direction): string => {
+  if (direction.x === 0 && direction.y === -1) return 'up';
+  if (direction.x === 0 && direction.y === 1) return 'down';
+  if (direction.x === -1 && direction.y === 0) return 'left';
+  if (direction.x === 1 && direction.y === 0) return 'right';
+  return `${direction.x},${direction.y}`;
+};
+
 export default function App() {
   const [snake, setSnake] = useState<Coord[]>(() => getInitialSnake());
   const [foods, setFoods] = useState<Food[]>(() => createInitialFoods(getInitialSnake()));
@@ -55,19 +65,36 @@ export default function App() {
   const [runSession, setRunSession] = useState<RunSession | null>(null);
 
   const directionRef = useRef<Direction>(INITIAL_DIRECTION);
-  const pendingDirectionRef = useRef<Direction | null>(null);
+  const queuedDirectionsRef = useRef<Direction[]>([]);
+  const snakeRef = useRef<Coord[]>(snake);
   const pendingGrowthRef = useRef(0);
   const foodsRef = useRef<Food[]>(foods);
   const scoreRef = useRef(score);
   const foodsEatenRef = useRef(foodsEaten);
   const runSessionRef = useRef<RunSession | null>(runSession);
   const runStartRequestIdRef = useRef(0);
+  const inputDebugLogRef = useRef<string[]>([]);
+  const lastMovementAtRef = useRef(0);
 
   const { faceParticles, spawnFaceParticles, clearFaceParticles } = useFaceParticles();
+
+  const logInputEvent = useCallback((message: string) => {
+    const entry = `${new Date().toISOString()} ${message}`;
+    const nextLog = [...inputDebugLogRef.current, entry].slice(-250);
+    inputDebugLogRef.current = nextLog;
+
+    try {
+      window.localStorage.setItem(INPUT_DEBUG_STORAGE_KEY, nextLog.join('\n'));
+    } catch {}
+  }, []);
 
   useEffect(() => {
     foodsRef.current = foods;
   }, [foods]);
+
+  useEffect(() => {
+    snakeRef.current = snake;
+  }, [snake]);
 
   useEffect(() => {
     scoreRef.current = score;
@@ -298,24 +325,75 @@ export default function App() {
     clearFaceParticles();
 
     foodsRef.current = nextFoods;
+    snakeRef.current = initialSnake;
     scoreRef.current = 0;
     foodsEatenRef.current = 0;
     pendingGrowthRef.current = 0;
     directionRef.current = INITIAL_DIRECTION;
-    pendingDirectionRef.current = null;
+    queuedDirectionsRef.current = [];
+    inputDebugLogRef.current = [];
+    lastMovementAtRef.current = 0;
+
+    try {
+      window.localStorage.removeItem(INPUT_DEBUG_STORAGE_KEY);
+    } catch {}
 
     setPhase('play');
     void startSecureRun();
   }, [clearFaceParticles, startSecureRun]);
 
+  const willCollideWithDirection = useCallback((currentSnake: Coord[], direction: Direction): boolean => {
+    const head = currentSnake[0];
+    const nextHead: Coord = {
+      x: head.x + direction.x,
+      y: head.y + direction.y,
+    };
+
+    const hitWall =
+      nextHead.x < 0 ||
+      nextHead.y < 0 ||
+      nextHead.x >= GRID_SIZE ||
+      nextHead.y >= GRID_SIZE;
+
+    if (hitWall) return true;
+
+    const eatenFood = foodsRef.current.some((food) => food.x === nextHead.x && food.y === nextHead.y);
+    const tailWillMove = !eatenFood && pendingGrowthRef.current <= 0;
+    const collisionBody = tailWillMove ? currentSnake.slice(0, -1) : currentSnake;
+
+    return collisionBody.some((segment) => segment.x === nextHead.x && segment.y === nextHead.y);
+  }, []);
+
   const queueDirection = useCallback(
     (direction: Direction | null) => {
       if (phase !== 'play' || gameOver || !direction) return;
-      if (pendingDirectionRef.current) return;
-      if (isReverse(direction, directionRef.current)) return;
-      pendingDirectionRef.current = direction;
+
+      const queue = queuedDirectionsRef.current;
+      const lastPlannedDirection = queue.length > 0 ? queue[queue.length - 1] : directionRef.current;
+
+      if (isReverse(direction, lastPlannedDirection)) {
+        logInputEvent(
+          `reject reverse input=${directionLabel(direction)} planned=${directionLabel(lastPlannedDirection)}`,
+        );
+        return;
+      }
+      if (direction.x === lastPlannedDirection.x && direction.y === lastPlannedDirection.y) {
+        logInputEvent(`reject duplicate input=${directionLabel(direction)}`);
+        return;
+      }
+      if (queue.length >= 2) {
+        logInputEvent(`reject queue-full input=${directionLabel(direction)}`);
+        return;
+      }
+
+      queue.push(direction);
+      logInputEvent(
+        `queue input=${directionLabel(direction)} current=${directionLabel(directionRef.current)} queued=${queue
+          .map(directionLabel)
+          .join(',')}`,
+      );
     },
-    [gameOver, phase],
+    [gameOver, logInputEvent, phase],
   );
 
   useEffect(() => {
@@ -346,128 +424,179 @@ export default function App() {
   useEffect(() => {
     if (phase !== 'play' || gameOver) return undefined;
 
-    const speed = Math.max(62, 138 - levelForScore(score) * 8);
+    const runTick = () => {
+      const now = performance.now();
+      const currentSpeed = Math.max(62, 138 - levelForScore(scoreRef.current) * 8);
+      const minimumGap = Math.max(28, Math.floor(currentSpeed * 0.7));
 
-    const timer = window.setInterval(() => {
-      setSnake((currentSnake) => {
-        if (pendingDirectionRef.current && !isReverse(pendingDirectionRef.current, directionRef.current)) {
-          directionRef.current = pendingDirectionRef.current;
+      if (lastMovementAtRef.current > 0 && now - lastMovementAtRef.current < minimumGap) {
+        logInputEvent(`skip duplicate-tick deltaMs=${Math.round(now - lastMovementAtRef.current)}`);
+        return;
+      }
+
+      lastMovementAtRef.current = now;
+
+      const currentSnake = snakeRef.current;
+      let appliedQueuedDirection = false;
+
+      while (queuedDirectionsRef.current.length > 0) {
+        const nextQueuedDirection = queuedDirectionsRef.current[0];
+        if (!nextQueuedDirection) break;
+
+        if (isReverse(nextQueuedDirection, directionRef.current)) {
+          queuedDirectionsRef.current.shift();
+          logInputEvent(`drop queued reverse=${directionLabel(nextQueuedDirection)}`);
+          continue;
         }
-        pendingDirectionRef.current = null;
 
-        const direction = directionRef.current;
-        const head = currentSnake[0];
-        const nextHead: Coord = {
-          x: head.x + direction.x,
-          y: head.y + direction.y,
-        };
+        if (queuedDirectionsRef.current.length > 1 && willCollideWithDirection(currentSnake, nextQueuedDirection)) {
+          queuedDirectionsRef.current.shift();
+          logInputEvent(`drop queued collision=${directionLabel(nextQueuedDirection)} fallback-next`);
+          continue;
+        }
 
-        const eatenFoodIndex = foodsRef.current.findIndex(
-          (food) => food.x === nextHead.x && food.y === nextHead.y,
+        directionRef.current = nextQueuedDirection;
+        queuedDirectionsRef.current.shift();
+        appliedQueuedDirection = true;
+        break;
+      }
+
+      if (appliedQueuedDirection) {
+        logInputEvent(
+          `apply direction=${directionLabel(directionRef.current)} remaining=${queuedDirectionsRef.current
+            .map(directionLabel)
+            .join(',')}`,
         );
-        const eatenFood = eatenFoodIndex >= 0 ? foodsRef.current[eatenFoodIndex] : null;
-        const ateFood = Boolean(eatenFood);
-        const tailWillMove = !ateFood && pendingGrowthRef.current <= 0;
-        const collisionBody = tailWillMove ? currentSnake.slice(0, -1) : currentSnake;
+      }
 
-        const hitWall =
-          nextHead.x < 0 ||
-          nextHead.y < 0 ||
-          nextHead.x >= GRID_SIZE ||
-          nextHead.y >= GRID_SIZE;
+      const direction = directionRef.current;
+      const head = currentSnake[0];
+      const nextHead: Coord = {
+        x: head.x + direction.x,
+        y: head.y + direction.y,
+      };
 
-        const hitSelf = collisionBody.some(
-          (segment) => segment.x === nextHead.x && segment.y === nextHead.y,
+      const eatenFoodIndex = foodsRef.current.findIndex(
+        (food) => food.x === nextHead.x && food.y === nextHead.y,
+      );
+      const eatenFood = eatenFoodIndex >= 0 ? foodsRef.current[eatenFoodIndex] : null;
+      const ateFood = Boolean(eatenFood);
+      const tailWillMove = !ateFood && pendingGrowthRef.current <= 0;
+      const collisionBody = tailWillMove ? currentSnake.slice(0, -1) : currentSnake;
+
+      const hitWall =
+        nextHead.x < 0 ||
+        nextHead.y < 0 ||
+        nextHead.x >= GRID_SIZE ||
+        nextHead.y >= GRID_SIZE;
+
+      const hitSelf = collisionBody.some((segment) => segment.x === nextHead.x && segment.y === nextHead.y);
+
+      if (hitWall || hitSelf) {
+        logInputEvent(
+          `death dir=${directionLabel(direction)} next=${nextHead.x},${nextHead.y} hitWall=${String(hitWall)} hitSelf=${String(hitSelf)}`,
         );
+        setGameOver(true);
+        return;
+      }
 
-        if (hitWall || hitSelf) {
-          setGameOver(true);
-          return currentSnake;
+      const movedSnake = [nextHead, ...currentSnake];
+
+      if (!ateFood) {
+        if (pendingGrowthRef.current > 0) {
+          pendingGrowthRef.current -= 1;
+        } else {
+          movedSnake.pop();
         }
+      }
 
-        const movedSnake = [nextHead, ...currentSnake];
+      if (eatenFood) {
+        const foodsEatenNext = foodsEatenRef.current + 1;
+        foodsEatenRef.current = foodsEatenNext;
+        setFoodsEaten(foodsEatenNext);
 
-        if (!ateFood) {
-          if (pendingGrowthRef.current > 0) {
-            pendingGrowthRef.current -= 1;
-          } else {
-            movedSnake.pop();
-          }
+        let growthBoost = eatenFood.kind === 'bonus' ? 1 : 0;
+        if (foodsEatenNext % FOODS_PER_GROWTH_BOOST === 0) {
+          growthBoost += GROWTH_BOOST_SEGMENTS;
         }
+        pendingGrowthRef.current += growthBoost;
 
-        if (eatenFood) {
-          const foodsEatenNext = foodsEatenRef.current + 1;
-          foodsEatenRef.current = foodsEatenNext;
-          setFoodsEaten(foodsEatenNext);
+        const gainedPoints = eatenFood.kind === 'bonus' ? BONUS_POINTS : 1;
+        const nextScore = scoreRef.current + gainedPoints;
+        scoreRef.current = nextScore;
+        setScore(nextScore);
 
-          let growthBoost = eatenFood.kind === 'bonus' ? 1 : 0;
-          if (foodsEatenNext % FOODS_PER_GROWTH_BOOST === 0) {
-            growthBoost += GROWTH_BOOST_SEGMENTS;
-          }
-          pendingGrowthRef.current += growthBoost;
+        window.requestAnimationFrame(() => spawnFaceParticles(nextHead.x, nextHead.y));
+      }
 
-          const gainedPoints = eatenFood.kind === 'bonus' ? BONUS_POINTS : 1;
-          const nextScore = scoreRef.current + gainedPoints;
-          scoreRef.current = nextScore;
-          setScore(nextScore);
+      const currentFoods = foodsRef.current;
+      const hasBonusFood = currentFoods.some((food) => food.kind === 'bonus');
+      let nextFoods = currentFoods;
+      let foodsChanged = false;
 
-          window.requestAnimationFrame(() => spawnFaceParticles(nextHead.x, nextHead.y));
-        }
+      if (eatenFoodIndex >= 0 || hasBonusFood) {
+        nextFoods = currentFoods
+          .filter((_, index) => index !== eatenFoodIndex)
+          .map((food) => (food.kind === 'bonus' ? { ...food, ttl: food.ttl - 1 } : food))
+          .filter((food) => food.kind !== 'bonus' || food.ttl > 0);
+        foodsChanged = true;
+      }
 
-        const currentFoods = foodsRef.current;
-        const hasBonusFood = currentFoods.some((food) => food.kind === 'bonus');
-        let nextFoods = currentFoods;
-        let foodsChanged = false;
+      const projectedScore = scoreRef.current;
+      const targetRegularCount = targetFoodCountForScore(projectedScore);
 
-        if (eatenFoodIndex >= 0 || hasBonusFood) {
-          nextFoods = currentFoods
-            .filter((_, index) => index !== eatenFoodIndex)
-            .map((food) => (food.kind === 'bonus' ? { ...food, ttl: food.ttl - 1 } : food))
-            .filter((food) => food.kind !== 'bonus' || food.ttl > 0);
+      while (nextFoods.filter((food) => food.kind === 'regular').length < targetRegularCount) {
+        const regularFood = spawnFood(movedSnake, nextFoods, 'regular');
+        if (!regularFood) break;
+
+        if (!foodsChanged) {
+          nextFoods = [...nextFoods];
           foodsChanged = true;
         }
 
-        const projectedScore = scoreRef.current;
-        const targetRegularCount = targetFoodCountForScore(projectedScore);
+        nextFoods.push(regularFood);
+      }
 
-        while (nextFoods.filter((food) => food.kind === 'regular').length < targetRegularCount) {
-          const regularFood = spawnFood(movedSnake, nextFoods, 'regular');
-          if (!regularFood) break;
-
+      if (
+        projectedScore >= 5 &&
+        !nextFoods.some((food) => food.kind === 'bonus') &&
+        Math.random() < BONUS_FOOD_CHANCE
+      ) {
+        const bonusFood = spawnFood(movedSnake, nextFoods, 'bonus');
+        if (bonusFood) {
           if (!foodsChanged) {
             nextFoods = [...nextFoods];
             foodsChanged = true;
           }
-
-          nextFoods.push(regularFood);
+          nextFoods.push(bonusFood);
         }
+      }
 
-        if (
-          projectedScore >= 5 &&
-          !nextFoods.some((food) => food.kind === 'bonus') &&
-          Math.random() < BONUS_FOOD_CHANCE
-        ) {
-          const bonusFood = spawnFood(movedSnake, nextFoods, 'bonus');
-          if (bonusFood) {
-            if (!foodsChanged) {
-              nextFoods = [...nextFoods];
-              foodsChanged = true;
-            }
-            nextFoods.push(bonusFood);
-          }
-        }
+      if (foodsChanged) {
+        foodsRef.current = nextFoods;
+        setFoods(nextFoods);
+      }
 
-        if (foodsChanged) {
-          foodsRef.current = nextFoods;
-          setFoods(nextFoods);
-        }
+      snakeRef.current = movedSnake;
+      setSnake(movedSnake);
+    };
 
-        return movedSnake;
-      });
-    }, speed);
+    let animationFrameId = 0;
+    let nextTickAt = performance.now() + Math.max(62, 138 - levelForScore(scoreRef.current) * 8);
 
-    return () => window.clearInterval(timer);
-  }, [gameOver, phase, score, spawnFaceParticles]);
+    const frame = (now: number) => {
+      if (now >= nextTickAt) {
+        runTick();
+        const nextSpeed = Math.max(62, 138 - levelForScore(scoreRef.current) * 8);
+        nextTickAt = now + nextSpeed;
+      }
+
+      animationFrameId = window.requestAnimationFrame(frame);
+    };
+
+    animationFrameId = window.requestAnimationFrame(frame);
+    return () => window.cancelAnimationFrame(animationFrameId);
+  }, [gameOver, logInputEvent, phase, spawnFaceParticles, willCollideWithDirection]);
 
   const snakeColorMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -483,7 +612,9 @@ export default function App() {
 
   const foodMap = useMemo(() => {
     const map = new Map<string, Food['kind']>();
-    foods.forEach((food) => map.set(coordKey(food), food.kind));
+    foods.forEach((food) => {
+      map.set(coordKey(food), food.kind);
+    });
     return map;
   }, [foods]);
 
