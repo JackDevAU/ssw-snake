@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ssw-snake-game",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-02-20",
+  "workers_dev": true,
+  "preview_urls": true,
+  "routes": [{ "pattern": "snake.jackpettit.dev", "custom_domain": true }],
+  "durable_objects": {
+    "bindings": [{ "name": "LEADERBOARD", "class_name": "Leaderboard" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Leaderboard"] }],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/leaderboard"]
+  }
+}
